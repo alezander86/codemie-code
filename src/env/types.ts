@@ -131,6 +131,7 @@ export interface ProviderProfile {
 
   // Claude Code-specific settings
   claudeAutocompactPct?: number; // Auto-compact threshold percentage (sets CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, default: 70)
+  claudeEnablePromptCaching1h?: boolean; // Enable 1-hour prompt cache TTL (sets ENABLE_PROMPT_CACHING_1H=1, default: false — Bedrock deployments don't support cache_control blocks)
 
   // Statusline budget tracking
   statuslineBudgetName?: string; // Budget row name selected during statusline install

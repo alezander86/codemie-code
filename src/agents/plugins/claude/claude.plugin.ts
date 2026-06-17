@@ -176,7 +176,20 @@ export const ClaudePluginMetadata: AgentMetadata = {
       }
 
       if (!env.ENABLE_PROMPT_CACHING_1H) {
-        env.ENABLE_PROMPT_CACHING_1H = '1';
+        // Default OFF: cache_control blocks are not supported by Bedrock-backed deployments.
+        // Opt in via profile config claudeEnablePromptCaching1h: true (direct Anthropic only).
+        let enablePromptCaching1h = false;
+        if (env.CODEMIE_PROFILE_CONFIG) {
+          try {
+            const profileConfig = JSON.parse(env.CODEMIE_PROFILE_CONFIG);
+            if (profileConfig.claudeEnablePromptCaching1h === true) {
+              enablePromptCaching1h = true;
+            }
+          } catch {
+            // ignore malformed profile config
+          }
+        }
+        env.ENABLE_PROMPT_CACHING_1H = enablePromptCaching1h ? '1' : '0';
       }
 
       if (!env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {

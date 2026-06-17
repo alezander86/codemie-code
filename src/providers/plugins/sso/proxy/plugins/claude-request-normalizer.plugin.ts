@@ -16,6 +16,10 @@
  * - Haiku models reject thinking field with HTTP 400
  * - Opus 4-7+ requires adaptive thinking format with output_config.effort
  *
+ * Also handles Bedrock tool_choice compatibility:
+ * 3. tool_choice present with no tools (e.g. during context compaction):
+ *    → strips tool_choice to prevent litellm.UnsupportedParamsError from Bedrock
+ *
  * Scope: Enabled for codemie-claude (Claude Code via SSO proxy) and claude-desktop (Desktop 3P mode).
  *
  * To add model support: update NO_THINKING_MODEL_PATTERNS or ADAPTIVE_THINKING_MODEL_PATTERNS.
@@ -61,6 +65,27 @@ function budgetTokensToEffort(budgetTokens: unknown): 'low' | 'medium' | 'high' 
   if (tokens <= 2048) return 'low';
   if (tokens <= 8192) return 'medium';
   return 'high';
+}
+
+/**
+ * Handler: strips tool_choice when tools list is absent or empty.
+ * Bedrock rejects requests where tool_choice is set but no tools are provided.
+ * This happens during context compaction when Claude Code sends tool_choice
+ * without any tool definitions, causing litellm.UnsupportedParamsError.
+ */
+function handleToolChoiceWithoutTools(body: any): boolean {
+  if (!body.tool_choice) {
+    return false;
+  }
+
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  if (hasTools) {
+    return false;
+  }
+
+  delete body.tool_choice;
+  logger.debug('[claude-request-normalizer] Stripped tool_choice: no tools defined (prevents Bedrock UnsupportedParamsError)');
+  return true;
 }
 
 /**
@@ -146,19 +171,26 @@ class ClaudeRequestNormalizerInterceptor implements ProxyInterceptor {
       const bodyStr = context.requestBody.toString('utf-8');
       const body = JSON.parse(bodyStr);
 
-      if (!body.thinking) {
+      if (!body.thinking && !body.tool_choice) {
         return;
       }
 
-      const model = (typeof body.model === 'string' && body.model) || this.configModel || '';
-      if (!model) {
-        return;
+      let modified = false;
+
+      // Handle thinking parameter normalization (model-specific)
+      if (body.thinking) {
+        const model = (typeof body.model === 'string' && body.model) || this.configModel || '';
+        if (model) {
+          modified =
+            handleNoThinkingModels(body, model) ||
+            handleAdaptiveThinkingTransform(body, model);
+        }
       }
 
-      // Chain handlers: first match wins and modifies body
-      const modified =
-        handleNoThinkingModels(body, model) ||
-        handleAdaptiveThinkingTransform(body, model);
+      // Handle tool_choice without tools (Bedrock compatibility, runs independently)
+      if (handleToolChoiceWithoutTools(body)) {
+        modified = true;
+      }
 
       if (modified) {
         const newBodyStr = JSON.stringify(body);
