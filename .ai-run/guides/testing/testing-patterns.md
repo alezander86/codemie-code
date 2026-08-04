@@ -95,6 +95,21 @@ Why: Static imports happen before `beforeEach`; the module caches the `exec` ref
 
 ---
 
+## Lazy-Getter Override for Class-Level Statics
+
+Rule: When a class initialises a static field from a path utility at class-load time, a spy set up in `beforeEach` cannot intercept that call — it already ran before the test suite started. Convert the field to a lazy getter that resolves the value on first access; add a paired private setter so tests can write a direct override without a spy.
+
+| Bad | Best |
+|---|---|
+| `private static GLOBAL_CONFIG = getCodemiePath(...)` | `private static get GLOBAL_CONFIG(): string { return this._override ?? getCodemiePath(...); }` |
+| `vi.spyOn(paths, 'getCodemiePath')` in `beforeEach` never intercepted — field resolved at class-load | Getter resolves at access time; spy in `beforeEach` is honored |
+
+Reference: `src/utils/config.ts:47-60` — `ConfigLoader.GLOBAL_CONFIG_DIR` and `GLOBAL_CONFIG` converted from static fields to lazy getter/setter pairs.
+
+Why: Same root cause as the dynamic-import problem — resolution happens before test setup. A lazy getter shifts it to runtime without changing production behavior.
+
+---
+
 ## Testing Async Operations
 
 Rule: Use `await expect(...).rejects.toThrow(ErrorClass)` for async error assertions; alternatively use try/catch to inspect error properties.
@@ -122,6 +137,41 @@ try {
   expect((error as NpmError).code).toBe(NpmErrorCode.PERMISSION_ERROR);
 }
 ```
+
+---
+
+## Cross-Platform Path/URL Assertions
+
+Rule: Never hardcode POSIX-style path or `file://` URL literals in test expectations. Derive paths through `path.join()`/`path.resolve()` and build `file://` URLs via `url.pathToFileURL()`, so the assertion matches whatever separator/encoding the current OS actually produces.
+
+Reference: `src/agents/plugins/claude/plugin/__tests__/statusline.test.ts:276-301`, `src/agents/plugins/claude/__tests__/statusline-installer.test.ts:26-35`
+
+| Bad | Best |
+|-----|------|
+| `expect(result.scriptPath).toBe('/home/testuser/claude/x.js')` | `expect(result.scriptPath).toBe(join(CLAUDE_HOME, 'x.js'))` |
+| `isMainModule(p, 'file:///Users/me/script.mjs')` | `isMainModule(p, pathToFileURL(p).href)` |
+
+Why: `path.join()` uses backslashes on Windows; a hardcoded forward-slash literal only matches on POSIX. This exact class of bug reached CI twice in one PR (#418) — undetected locally because macOS/Linux never surface it.
+
+---
+
+## Testing Dependency-Free Scripts via Parameter Injection
+
+Rule: For a standalone script that must stay import-free of the project's `src/` tree (deployed and run outside the compiled package), avoid `vi.mock()` on its own filesystem/network calls. Instead, give the function optional parameters defaulting to the real dependency, and pass fakes directly in tests.
+
+Reference: `src/agents/plugins/claude/plugin/statusline.mjs:188-246`, `src/agents/plugins/claude/plugin/__tests__/statusline.test.ts:185-273`
+
+```typescript
+export async function resolveBudget({
+  readFile = fs.readFile,
+  fetchImpl = fetch,
+} = {}) { /* ... */ }
+
+// test: no vi.mock() needed — pass fakes directly
+await resolveBudget({ readFile: vi.fn().mockResolvedValue(...), fetchImpl: vi.fn() });
+```
+
+Why: `vi.mock('fs/promises')` only intercepts imports the *test file* resolves — a dependency-free deployed script that must remain framework-agnostic still needs a test seam. Default-parameter injection provides one without adding a runtime dependency.
 
 ---
 

@@ -272,9 +272,137 @@ describe('buildPayload', () => {
     expect(buildPayload(root, idx, summary, ctxAll).sessions[0].dispatches).toEqual(dispatches);
     expect(buildPayload(root, costIndex, summary, ctxAll).sessions[0].dispatches).toBeUndefined();
   });
+
+  it('includes userEmail, periodStart, periodEnd in meta when provided in context', () => {
+    const payload = buildPayload(root, costIndex, summary, {
+      rangeLabel: 'custom',
+      projectFilter: 'all',
+      generatedAt: '2026-07-21T00:00:00.000Z',
+      userEmail: 'alice@example.com',
+      periodStart: '2026-07-01T00:00:00.000Z',
+      periodEnd: '2026-07-21T23:59:59.000Z',
+    });
+    expect(payload.meta.userEmail).toBe('alice@example.com');
+    expect(payload.meta.periodStart).toBe('2026-07-01T00:00:00.000Z');
+    expect(payload.meta.periodEnd).toBe('2026-07-21T23:59:59.000Z');
+  });
+
+  it('omits userEmail/periodStart/periodEnd in meta when absent from context', () => {
+    const payload = buildPayload(root, costIndex, summary, ctxAll);
+    expect(payload.meta.userEmail).toBeUndefined();
+    expect(payload.meta.periodStart).toBeUndefined();
+    expect(payload.meta.periodEnd).toBeUndefined();
+  });
 });
 
 function emptyTokens() {
   return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0 };
 }
 const ctxAll = { rangeLabel: 'all', projectFilter: 'all', generatedAt: '2026-06-08T00:00:00Z' };
+
+/**
+ * Copilot CLI reports GitHub's real billing unit (premium requests) alongside tokens, and
+ * its older CLI versions record no token telemetry at all. Both are optional and additive,
+ * so every other agent's record must be unchanged.
+ */
+describe('buildPayload — copilot-cli specific fields', () => {
+  const copilotRoot = {
+    ...root,
+    projects: [
+      {
+        projectPath: '/repo/app',
+        branches: [
+          {
+            branchName: 'main',
+            sessions: [
+              session({ sessionId: 'cp-priced', agentName: 'copilot-cli' }),
+              session({ sessionId: 'cp-partial', agentName: 'copilot-cli' }),
+              session({ sessionId: 'cp-unpriced', agentName: 'copilot-cli' }),
+              session({ sessionId: 's1', agentName: 'claude' }),
+            ],
+          },
+        ],
+      },
+    ],
+  } as unknown as RootAnalytics;
+
+  const idx: SessionCostIndex = new Map([
+    [
+      'cp-priced',
+      {
+        sessionId: 'cp-priced',
+        tokens: { input: 381719, output: 173180, cacheRead: 13694976, cacheCreation: 0, total: 14249875 },
+        costUSD: 5.5,
+        perModel: [],
+        priced: true,
+        hadLog: true,
+        premiumRequests: 3,
+        usagePartial: false,
+      },
+    ],
+    [
+      'cp-partial',
+      {
+        sessionId: 'cp-partial',
+        tokens: { input: 0, output: 350, cacheRead: 0, cacheCreation: 0, total: 350 },
+        costUSD: 0.004,
+        perModel: [],
+        priced: true,
+        hadLog: true,
+        usagePartial: true,
+      },
+    ],
+    [
+      'cp-unpriced',
+      {
+        sessionId: 'cp-unpriced',
+        tokens: emptyTokens(),
+        costUSD: 0,
+        perModel: [],
+        priced: false,
+        hadLog: true,
+        usageUnavailableReason: 'No usage data in transcript — this Copilot CLI version recorded no token telemetry',
+      },
+    ],
+    ['s1', { sessionId: 's1', tokens: emptyTokens(), costUSD: 0, perModel: [], priced: true, hadLog: true }],
+  ] as never);
+
+  it('carries premium requests onto the session record', () => {
+    const payload = buildPayload(copilotRoot, idx, summary, ctxAll);
+    const rec = payload.sessions.find((s) => s.sessionId === 'cp-priced')!;
+
+    expect(rec.premiumRequests).toBe(3);
+    expect(rec.usagePartial).toBeUndefined(); // false is omitted, not emitted
+  });
+
+  it('flags a partially-reconstructed session', () => {
+    const payload = buildPayload(copilotRoot, idx, summary, ctxAll);
+    const rec = payload.sessions.find((s) => s.sessionId === 'cp-partial')!;
+
+    expect(rec.usagePartial).toBe(true);
+  });
+
+  it('carries a reason for sessions with no usage data', () => {
+    const payload = buildPayload(copilotRoot, idx, summary, ctxAll);
+    const rec = payload.sessions.find((s) => s.sessionId === 'cp-unpriced')!;
+
+    expect(rec.usageUnavailableReason).toMatch(/no token telemetry/i);
+    expect(rec.costUSD).toBe(0);
+  });
+
+  it('omits all three fields entirely for other agents', () => {
+    const payload = buildPayload(copilotRoot, idx, summary, ctxAll);
+    const claude = payload.sessions.find((s) => s.sessionId === 's1')!;
+
+    expect(claude.premiumRequests).toBeUndefined();
+    expect(claude.usagePartial).toBeUndefined();
+    expect(claude.usageUnavailableReason).toBeUndefined();
+  });
+
+  it('counts unpriced copilot sessions in the existing AgentCoverage mechanism', () => {
+    const payload = buildPayload(copilotRoot, idx, summary, ctxAll);
+    const cov = payload.meta.coverage.find((c) => c.agentName === 'copilot-cli')!;
+
+    expect(cov).toEqual({ agentName: 'copilot-cli', total: 3, priced: 2, withLog: 3 });
+  });
+});

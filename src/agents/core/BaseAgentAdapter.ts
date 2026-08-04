@@ -27,6 +27,8 @@ import {
   executeOnSessionEnd,
   executeAfterRun
 } from './lifecycle-helpers.js';
+import { redactSecrets } from './config-redaction.js';
+import { extractGeneratedConfig } from './print-config.js';
 import inquirer from 'inquirer';
 
 /**
@@ -50,6 +52,45 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
    */
   setSilentMode(enabled: boolean): void {
     this.metadata.silentMode = enabled;
+  }
+
+  /**
+   * Writes a per-session analytics JSON report on session exit when the agent
+   * opts in (`metadata.sessionAnalyticsReport`) and the run did not disable it
+   * (`CODEMIE_SESSION_ANALYTICS_REPORT !== '0'`). Non-fatal: any failure is logged
+   * and swallowed so session finalization always completes.
+   */
+  private async maybeWriteSessionReport(env: NodeJS.ProcessEnv): Promise<void> {
+    if (!this.metadata.sessionAnalyticsReport) return;
+    if (env.CODEMIE_SESSION_ANALYTICS_REPORT === '0') return;
+    const sessionId = env.CODEMIE_SESSION_ID;
+    if (!sessionId) return;
+
+    try {
+      const { generateSessionReport } = await import('../../cli/commands/analytics/report/session-report.js');
+
+      // Email is available in CODEMIE_PROFILE_CONFIG (already parsed at adapter startup for other uses).
+      let userEmail: string | undefined;
+      if (env.CODEMIE_PROFILE_CONFIG) {
+        try {
+          const profileConfig = JSON.parse(env.CODEMIE_PROFILE_CONFIG) as { userEmail?: string };
+          userEmail = profileConfig.userEmail || undefined;
+        } catch {
+          // malformed env — omit email gracefully
+        }
+      }
+
+      const result = await generateSessionReport({ sessionId, userEmail });
+      if (result.written) {
+        logger.debug(`[${this.displayName}] Session analytics report written: ${result.written}`);
+      } else {
+        logger.debug(`[${this.displayName}] No analytics data for session ${sessionId}; report skipped`);
+      }
+    } catch (err) {
+      logger.warn(`[${this.displayName}] Session analytics report failed (non-fatal)`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -124,7 +165,7 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
    *
    * @param version - Specific version, 'supported', or undefined for latest
    */
-  async installVersion(version?: string): Promise<void> {
+  async installVersion(version?: string): Promise<string | null> {
     if (!this.metadata.npmPackage) {
       throw new Error(`${this.displayName} is built-in and cannot be installed`);
     }
@@ -149,6 +190,12 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
         throw new Error(`Failed to install ${this.displayName}: ${error.message}`);
       }
       throw error;
+    }
+
+    try {
+      return await this.getVersion();
+    } catch {
+      return null;
     }
   }
 
@@ -328,7 +375,11 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
   /**
    * Run the agent
    */
-  async run(args: string[], envOverrides?: Record<string, string>): Promise<void> {
+  async run(
+    args: string[],
+    envOverrides?: Record<string, string>,
+    runOptions?: { dryRun?: boolean },
+  ): Promise<void> {
     // Check version compatibility before running (only for agents with a supportedVersion configured)
     if (this.metadata.supportedVersion) {
       const compat = await this.checkVersionCompatibility();
@@ -532,6 +583,22 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
     // Can override or extend env transformations, setup config files
     env = await executeBeforeRun(this, this.metadata.lifecycle, this.metadata.name, env, this.extractConfig(env));
 
+    if (runOptions?.dryRun) {
+      try {
+        const generatedConfig = extractGeneratedConfig(env);
+        console.log(JSON.stringify(redactSecrets(generatedConfig), null, 2));
+      } finally {
+        // setupProxy() (called earlier in this method) may have started a real
+        // listening server for SSO/JWT-auth profiles. Without stopping it here,
+        // the process never exits after printing the config.
+        if (this.proxy) {
+          await this.proxy.stop();
+          this.proxy = null;
+        }
+      }
+      return;
+    }
+
     // Merge modified env back into process.env
     // This ensures enrichArgs hook can access variables set by beforeRun
     Object.assign(process.env, env);
@@ -682,7 +749,7 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
       const { getCommandPath } = await import('../../utils/processes.js');
       const resolvedPath = await getCommandPath(this.metadata.cliCommand);
       if (resolvedPath) {
-        commandPath = isWindows && /[ ()&|<>^%[\]{}]/.test(resolvedPath) ? `"${resolvedPath}"` : resolvedPath;
+        commandPath = isWindows && /[ \t,;=()&|<>^%[\]{}]/.test(resolvedPath) ? `"${resolvedPath}"` : resolvedPath;
         logger.debug(`Resolved command path: ${resolvedPath}`);
       } else if (!isWindows) {
         // On Unix, check common installation paths if command not found in PATH
@@ -719,6 +786,14 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
             }
           }
         }
+      }
+
+      // getCommandPath() may return null (binary not in PATH), leaving commandPath as the raw
+      // unquoted absolute path from plugin metadata. CMD.EXE treats bare '(' as a group delimiter
+      // and tab , ; = as token delimiters, so a path like C:\Users\Name(Org\...\bin\cmd.exe or
+      // C:\Users\Name;Org\... must be quoted before shell: true spawn.
+      if (isWindows && /[ \t,;=()&|<>^%[\]{}]/.test(commandPath) && !commandPath.startsWith('"')) {
+        commandPath = `"${commandPath}"`;
       }
 
       // When shell: true is needed (Windows), merge args into command to avoid DEP0190
@@ -806,6 +881,9 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
           if (code !== null) {
             await executeAfterRun(this, this.metadata.lifecycle, this.metadata.name, code, env);
           }
+
+          // Write the per-session analytics report (gated, non-fatal).
+          await this.maybeWriteSessionReport(env);
 
           // Show goodbye message with random easter egg (skip in silent mode for ACP)
           if (!this.metadata.silentMode) {
@@ -1031,15 +1109,27 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
     }
 
     // Transform model tiers (haiku/sonnet/opus)
+    // Note: All tier vars were already cleared in Step 1 above
     if (env.CODEMIE_HAIKU_MODEL && envMapping.haikuModel) {
       for (const envVar of envMapping.haikuModel) {
         env[envVar] = env.CODEMIE_HAIKU_MODEL;
       }
     }
-    if (env.CODEMIE_SONNET_MODEL && envMapping.sonnetModel) {
+    if (env.CODEMIE_SONNET_MODEL && env.CODEMIE_SONNET_MODEL !== env.CODEMIE_HAIKU_MODEL && envMapping.sonnetModel) {
+      // Distinct sonnet tier — map to all target vars normally
       for (const envVar of envMapping.sonnetModel) {
         env[envVar] = env.CODEMIE_SONNET_MODEL;
       }
+    } else if ((!env.CODEMIE_SONNET_MODEL || env.CODEMIE_SONNET_MODEL === env.CODEMIE_HAIKU_MODEL) && env.CODEMIE_OPUS_MODEL && envMapping.sonnetModel?.includes('CLAUDE_CODE_SUBAGENT_MODEL')) {
+      // No distinct sonnet tier, opus provisioned: route subagent to opus.
+      // ANTHROPIC_DEFAULT_SONNET_MODEL is intentionally left unset to prevent
+      // duplicate-ID display in /model (EPMCDME-12779).
+      env['CLAUDE_CODE_SUBAGENT_MODEL'] = env.CODEMIE_OPUS_MODEL;
+    } else if ((!env.CODEMIE_SONNET_MODEL || env.CODEMIE_SONNET_MODEL === env.CODEMIE_HAIKU_MODEL) && !env.CODEMIE_OPUS_MODEL && env.CODEMIE_HAIKU_MODEL && envMapping.sonnetModel?.includes('CLAUDE_CODE_SUBAGENT_MODEL')) {
+      // Haiku-only tenant: route subagent to haiku.
+      // ANTHROPIC_DEFAULT_SONNET_MODEL is intentionally left unset to prevent
+      // duplicate-ID display in /model (EPMCDME-12779).
+      env['CLAUDE_CODE_SUBAGENT_MODEL'] = env.CODEMIE_HAIKU_MODEL;
     }
     if (env.CODEMIE_OPUS_MODEL && envMapping.opusModel) {
       for (const envVar of envMapping.opusModel) {

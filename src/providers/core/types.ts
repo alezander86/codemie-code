@@ -41,6 +41,28 @@ export interface ModelMetadata {
 export type AuthenticationType = 'api-key' | 'sso' | 'oauth' | 'jwt' | 'none';
 
 /**
+ * Known provider names — use instead of hardcoded strings
+ */
+export const ProviderName = {
+  BEARER_AUTH: 'bearer-auth',
+  AI_RUN_SSO: 'ai-run-sso',
+  LITELLM: 'litellm',
+  BEDROCK: 'bedrock',
+  OLLAMA: 'ollama',
+  ANTHROPIC_SUBSCRIPTION: 'anthropic-subscription',
+} as const;
+
+/**
+ * Auth method values — use instead of hardcoded strings
+ */
+export const AuthMethod = {
+  JWT: 'jwt',
+  SSO: 'sso',
+  MANUAL: 'manual',
+  API_KEY: 'api-key',
+} as const;
+
+/**
  * Provider template - declarative metadata
  *
  * Auto-registers with ProviderRegistry via @registerProvider decorator
@@ -250,6 +272,35 @@ export interface ProviderCredentials {
 }
 
 /**
+ * CodeMie session already established by the setup wizard before provider
+ * setup steps run (during the mandatory-integration gate).
+ *
+ * Provider setup steps that would otherwise prompt for the portal URL,
+ * open a browser for SSO, and ask for a project must reuse this instead,
+ * so the user authenticates exactly once per `codemie setup` run.
+ */
+export interface CodeMieSetupSession {
+  codeMieUrl: string;
+  authResult: SSOAuthResult;
+  project: string;
+  userEmail: string;
+}
+
+/**
+ * Context passed from the setup wizard into provider setup steps.
+ * When enforcedIntegration is set, the provider must enforce API key entry.
+ */
+export interface SetupContext {
+  enforcedIntegration?: {
+    id: string;
+    alias: string;
+    codeMieUrl: string;
+  };
+  /** Reusable CodeMie session; present only when the wizard already authenticated. */
+  codeMieSession?: CodeMieSetupSession;
+}
+
+/**
  * Validation result
  */
 export interface ValidationResult {
@@ -274,7 +325,7 @@ export interface ProviderSetupSteps {
    *
    * Interactive prompts for API keys, URLs, etc.
    */
-  getCredentials(isUpdate?: boolean): Promise<ProviderCredentials>;
+  getCredentials(isUpdate?: boolean, context?: SetupContext): Promise<ProviderCredentials>;
 
   /**
    * Step 2: Fetch available models

@@ -14,6 +14,9 @@ export interface PayloadContext {
   rangeLabel: string;
   projectFilter: string;
   generatedAt: string; // ISO — caller stamps it
+  userEmail?: string;   // caller stamps; absent when not authenticated
+  periodStart?: string; // ISO — caller stamps from filter or session start
+  periodEnd?: string;   // ISO — caller stamps from filter or session end
 }
 
 export function buildPayload(
@@ -83,6 +86,13 @@ export function buildPayload(
           costUSD: cost?.costUSD ?? 0,
           cacheReadCostUSD: cost?.cacheReadCostUSD ?? 0,
           perModelCost: cost?.perModel ?? [],
+          // Optional and additive — omitted entirely for agents that record full usage,
+          // so no other agent's record changes shape.
+          ...(cost?.premiumRequests !== undefined ? { premiumRequests: cost.premiumRequests } : {}),
+          ...(cost?.usagePartial ? { usagePartial: true } : {}),
+          ...(cost?.usageUnavailableReason
+            ? { usageUnavailableReason: cost.usageUnavailableReason }
+            : {}),
           ...(cost?.costSeries && cost.costSeries.length ? { costSeries: cost.costSeries } : {}),
           ...(cost?.dispatches && cost.dispatches.length ? { dispatches: cost.dispatches } : {}),
           skillInvocations,
@@ -138,6 +148,9 @@ export function buildPayload(
     },
     unpricedModels: summary.unpricedModels,
     coverage: [...coverageMap.values()].sort((a, b) => b.total - a.total),
+    ...(ctx.userEmail !== undefined && { userEmail: ctx.userEmail }),
+    ...(ctx.periodStart !== undefined && { periodStart: ctx.periodStart }),
+    ...(ctx.periodEnd !== undefined && { periodEnd: ctx.periodEnd }),
   };
 
   return { meta, sessions };

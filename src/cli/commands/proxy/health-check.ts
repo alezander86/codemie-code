@@ -91,7 +91,7 @@ export async function checkProxyHealth(
         healthy: false,
         level: 'deep',
         code: 'unauthorized',
-        reason: 'SSO session expired — run `codemie proxy connect desktop` to re-login.',
+        reason: 'SSO session expired — run `codemie profile login` and restart the proxy.',
       };
     }
     if (!res.ok) {
@@ -100,6 +100,15 @@ export async function checkProxyHealth(
         level: 'deep',
         code: 'upstream-error',
         reason: `Upstream model discovery returned ${res.status}`,
+      };
+    }
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/json')) {
+      return {
+        healthy: false,
+        level: 'deep',
+        code: 'unauthorized',
+        reason: 'SSO session expired — run `codemie proxy stop && codemie profile login` to re-authenticate.',
       };
     }
     return { healthy: true, level: 'deep', code: 'ok' };

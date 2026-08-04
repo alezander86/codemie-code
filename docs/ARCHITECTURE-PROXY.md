@@ -33,6 +33,7 @@ The CodeMie Proxy is a **plugin-based HTTP streaming proxy** that sits between A
 - **Observability**: Detailed logging and metrics collection
 - **Metrics Sync**: Background sync of session metrics to CodeMie API
 - **Desktop Telemetry**: Local Claude Desktop 3P transcript discovery and conversation sync when daemon mode is enabled
+- **VS Code BYOK**: Profile-configured OpenAI-compatible custom endpoints with transparent forwarding
 - **Extensibility**: Plugin architecture for future features
 
 ### 1.2 Key Design Principles
@@ -704,6 +705,49 @@ The MCP Auth Plugin works in conjunction with the stdio-to-HTTP bridge:
 - `CODEMIE_PROXY_PORT`: Fixed proxy port (for stable MCP auth URLs across restarts)
 
 **Log Location**: `~/.codemie/logs/mcp-proxy.log`
+
+### 6.6 VS Code BYOK Profile Configuration
+
+`codemie proxy connect vscode` resolves one effective CodeMie profile before configuring the client. The selected profile's `model` is written directly to VS Code's `models[].id`, which is the identifier VS Code sends in inference requests. The profile's `codeMieProject` is passed independently to the daemon for `X-CodeMie-Project` header injection.
+
+The persistent daemon never receives a configured model and does not rewrite request bodies. It validates the local gateway key, injects SSO authentication and CodeMie context headers, then forwards request and response bodies through the existing streaming path byte-for-byte.
+
+The command reuses a healthy daemon when its profile, project, provider, target URL, and `vscode-byok` client type match. Model changes only rewrite VS Code configuration; they do not restart the daemon.
+
+The connector merges one managed model into VS Code's `chatLanguageModels.json` and preserves unrelated models plus an existing `${input:chat.lm.secret.*}` reference as `apiKey`. If no valid reference exists, it omits `apiKey` rather than generating a placeholder and directs the user to open `Chat: Manage Language Models`, right-click **CodeMie Profile Model**, and choose **Update API Key**. VS Code then stores the local `codemie-proxy` key in secret storage; CodeMie SSO credentials never enter VS Code configuration.
+
+GPT-5.5 and all three GPT-5.6 entries use `/v1/responses` with
+`zeroDataRetentionEnabled: true`, `thinking: true`, and Responses-format reasoning efforts. VS
+Code owns the complete conversation history for these entries and sends stateless requests with
+`store: false`, no `previous_response_id`, and replayed assistant, function-call, and
+function-call-output items. This keeps LiteLLM free to load-balance each request across Azure
+deployments.
+
+The proxy performs only bounded compatibility normalization for `vscode-byok`: it constrains the
+Responses `user` identifier and removes deployment-bound encrypted reasoning state. It preserves
+the selected `reasoning.effort`, visible messages, assistant phases, tools, call IDs, and tool
+outputs. The proxy does not persist conversation content, add session affinity, buffer Responses
+events, or transform the SSE stream. Removing encrypted state trades hidden-reasoning continuity
+for deployment-independent follow-ups, matching the established Codex compatibility behavior.
+
+```mermaid
+sequenceDiagram
+    participant VS as VS Code Agent
+    participant PX as CodeMie Proxy
+    participant GW as CodeMie Gateway
+    participant LM as Profile Model
+
+    VS->>PX: POST /v1/responses<br/>store=false<br/>input=full local history<br/>Bearer local gateway key
+    PX->>PX: Validate and strip local key
+    PX->>PX: Inject CodeMie SSO cookies
+    PX->>PX: Inject profile/project context headers
+    PX->>PX: Normalize user and strip encrypted reasoning state
+    PX->>GW: Forward stateless request
+    GW->>LM: Invoke configured model
+    LM-->>GW: Streaming events / tool calls
+    GW-->>PX: SSE stream
+    PX-->>VS: Byte-preserved SSE stream
+```
 
 ---
 

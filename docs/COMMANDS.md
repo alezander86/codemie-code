@@ -65,11 +65,119 @@ codemie-claude init bmad --bmad-set bmm.user_skill_level=expert bmm.project_know
 codemie proxy start              # Start the local proxy daemon
 codemie proxy stop               # Stop the local proxy daemon
 codemie proxy status             # Show daemon status
+codemie proxy connect vscode     # Configure VS Code BYOK to use the local proxy
 codemie proxy connect desktop    # Configure Claude Desktop (3P) to use the local proxy
 codemie proxy inspect desktop    # Inspect Desktop telemetry and sync state
 ```
 
 `codemie proxy connect desktop` does more than write the gateway config. When the daemon is started through this path, CodeMie also discovers Claude Desktop 3P local session transcripts from the `Claude-3p` storage directory and syncs metrics plus conversations to CodeMie with client identity `claude-desktop`.
+
+### VS Code BYOK custom endpoint
+
+Configure VS Code Stable with the currently selected SSO-backed CodeMie profile:
+
+```bash
+codemie proxy connect vscode
+codemie proxy connect vscode --profile work
+codemie proxy connect vscode --insiders
+```
+
+The connector resolves the selected profile once, synchronizes skills, and writes the managed CodeMie model catalog into VS Code's `User/chatLanguageModels.json`. VS Code sends the configured model ID directly; the proxy authenticates the request, adds CodeMie context headers, and applies only the documented compatibility normalization before forwarding.
+
+`--profile <name>` is a one-command override and does not change the active CodeMie profile. Model and project remain independent: the model is written into VS Code configuration, while `codeMieProject` is passed to the daemon and emitted as `X-CodeMie-Project`. When a selected profile has no project of its own, compatible repository-local project context continues to apply through the standard profile merge rules.
+
+The SSO credentials remain in CodeMie and are never added to VS Code. The connector preserves an existing `${input:chat.lm.secret.*}` reference, but does not write a plaintext key or generate a placeholder when no valid reference exists.
+
+For a new provider or an invalid existing key, the command prints this required one-time action:
+
+```text
+One-time VS Code secret setup required:
+1. Open VS Code and Press ⇧⌘P (macOS) or Ctrl+Shift+P (Windows/Linux).
+2. Find Chat: Manage Language Models
+3. In opened dialog Right-click any CodeMie model → Update API Key
+4. Enter API key: codemie-proxy
+Reload VS Code, then select a CodeMie model from the model picker
+```
+
+VS Code stores that local key in its secret storage and adds the reference to the configuration. The CLI cannot inspect whether an existing secret reference still resolves; if VS Code reports a missing or invalid key, use **Update API Key** again.
+
+The managed provider has this effective structure for a GPT-5.6 Responses entry. The port is taken from the running daemon, including a fallback port; other catalog entries retain their model-specific API type and capabilities:
+
+```json
+[
+  {
+    "name": "CodeMie",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "gpt-5.6-sol-2026-07-09",
+        "name": "gpt-5.6-sol-2026-07-09",
+        "url": "http://127.0.0.1:4001/v1/responses",
+        "apiType": "responses",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "zeroDataRetentionEnabled": true,
+        "supportsReasoningEffort": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "reasoningEffortFormat": "responses",
+        "maxInputTokens": 922000,
+        "maxOutputTokens": 128000
+      }
+    ]
+  }
+]
+```
+
+VS Code derives `medium` as the default reasoning effort from the managed model's supported
+effort levels and owns the selected model settings. The connector removes stale CodeMie model
+settings on each run to avoid racing with VS Code's configuration editor, while preserving
+unrelated providers, models, settings, and unknown provider properties. It rejects malformed JSON
+or a non-array root without overwriting the file. Re-running the command with another profile
+replaces the previous CodeMie-managed model without changing unrelated entries.
+
+GPT-5.5 and all three GPT-5.6 entries use the Responses API with
+`zeroDataRetentionEnabled: true` and Responses-format reasoning. Current VS Code builds use this
+flag to construct each request from the complete conversation held locally, send `store: false`,
+omit `previous_response_id`, and replay assistant, function-call, and function-call-output items.
+Use `medium` as the initial baseline; `none`, lower efforts, and `xhigh`/`max` remain selectable
+according to each model's advertised capability list.
+
+The proxy does not cache conversation state or rewrite response streams. Its bounded compatibility
+layer adds a safe `user` value when needed, limits long identifiers to 32 characters, and removes
+deployment-bound encrypted reasoning content for `vscode-byok`. This preserves the selected
+`reasoning.effort`, visible assistant history, and tool-call history, at the cost of cross-turn
+hidden-reasoning continuity. Prefer a current VS Code release (1.122 or newer) so the stateless
+flag and marker suppression are honored.
+
+Check the daemon context with `codemie proxy status`. Automated VS Code BYOK configuration
+and routing coverage runs as part of `npm run test:all`.
+
+#### Troubleshooting VS Code BYOK
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Model does not appear | VS Code has not reloaded the configuration | Reload VS Code and open Chat: Manage Language Models |
+| Missing or invalid API key | The secret reference does not resolve | Right-click CodeMie Profile Model → Update API Key and enter `codemie-proxy` again |
+| HTTP 401 from localhost | The stored local key is missing or stale | Right-click CodeMie Profile Model → Update API Key and enter `codemie-proxy` |
+| HTTP 401/403 from upstream | Expired SSO session | Run `codemie profile login`, stop, and restart the proxy |
+| Model-not-found error | VS Code still has an old profile model ID | Re-run `codemie proxy connect vscode` |
+| Configuration is rejected | `chatLanguageModels.json` is malformed or not an array | Repair the file; the connector leaves invalid content unchanged |
+| VS Code still uses old settings | Model configuration was not reloaded | Reload VS Code |
+| Active profile changed but model did not | VS Code configuration still contains the previous profile model | Re-run `codemie proxy connect vscode` |
+| `previous_response_id` appears in a VS Code request | VS Code is older than the stateless Responses implementation or has stale model metadata | Upgrade to a current VS Code release, re-run the connector, reload VS Code, and verify `store: false` plus no `previous_response_id` in Chat Debug logs |
+| `previous_response_not_found` occurs on a follow-up | The client is still using stateful Responses replay | Complete the compatibility check above; do not add proxy-side response caching or deployment affinity |
+| `invalid_encrypted_content` occurs on a follow-up | Encrypted reasoning state reached a different deployment or the sanitizer is not active | Use the current proxy, confirm the `vscode-byok` sanitizer is enabled, and retry without sharing encrypted reasoning content in logs |
+| An effort value is rejected | The selected effort is not supported by that model/deployment | Choose an advertised effort (`none`, `low`, `medium`, `high`, `xhigh`, or `max` as listed for the model) and certify the deployment before broad rollout |
+| Inline suggestions still use Copilot | Expected limitation | BYOK covers chat/agent workflows, not inline completion |
 
 ### Claude Desktop 3P
 
@@ -83,7 +191,7 @@ codemie proxy connect desktop --profile codemie-new
 ```
 
 Behavior:
-- uses the current active CodeMie profile by default
+- uses the effective active CodeMie profile by default (including a local selection that references a global profile)
 - `--profile` overrides for the current run only
 - fails if the resolved profile is not a CodeMie SSO profile
 
@@ -313,6 +421,17 @@ Omit `--task` to resume in interactive mode instead.
 | `codemie-opencode` | the `id` field from `opencode session list --format json` (e.g. `ses_…`) |
 
 An unknown or expired session id is passed straight through to the underlying CLI, which reports the error and exits with a non-zero status.
+
+### Printing the Generated Config (`--print-config`, OpenCode only)
+
+`--print-config` prints the opencode config CodeMie generated (profile/provider/model resolution, `beforeRun` hook) as JSON on stdout, then exits without starting opencode. Secrets are redacted: any key matching `apiKey`, `token`, `secret`, `password`, `privateKey`, `credentials`, or `authorization` (case-insensitive, any depth) is replaced with `***REDACTED***`. No proxy is left running and `--task` is not required.
+
+```bash
+codemie-opencode --print-config
+codemie-opencode --print-config --profile work --model claude-sonnet-4-6
+```
+
+Other agents (`codemie-claude`, `codemie-codex`, `codemie-gemini`) reject `--print-config` and exit with an error — only opencode generates its config this way.
 
 ### Capturing Output
 

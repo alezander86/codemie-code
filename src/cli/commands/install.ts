@@ -10,7 +10,6 @@ import {
   STATUSLINE_DESCRIPTION,
   installStatusline,
   isStatuslineInstalled,
-  promptBudgetSelection,
 } from '@/agents/plugins/claude/statusline-installer.js';
 import ora from 'ora';
 import chalk from 'chalk';
@@ -35,7 +34,7 @@ export function createInstallCommand(): Command {
       try {
         // If no name provided, show available agents and frameworks
         if (!name) {
-          const agents = AgentRegistry.getAllAgents();
+          const agents = AgentRegistry.getManageableAgents();
 
           console.log();
           console.log(chalk.bold('📦 Available Agents:\n'));
@@ -175,8 +174,9 @@ export function createInstallCommand(): Command {
 
           try {
             // Use installVersion if available and version specified
+            let installedVersion: string | null = null;
             if (versionToInstall && agent.installVersion) {
-              await agent.installVersion(versionToInstall);
+              installedVersion = await agent.installVersion(versionToInstall);
             } else {
               await agent.install();
             }
@@ -184,11 +184,29 @@ export function createInstallCommand(): Command {
             // Restore CLI bin link if overwritten by agent package
             await restoreCliBinLink();
 
-            // Get installed version for success message
-            const installedVersion = await agent.getVersion();
-            const installedVersionStr = installedVersion ? ` v${installedVersion}` : '';
+            // Use version returned by installVersion(); fall back to getVersion() when null
+            const displayVersion = installedVersion ?? await agent.getVersion();
+            const installedVersionStr = displayVersion ? ` v${displayVersion}` : '';
 
-            spinner.succeed(`${agent.displayName}${installedVersionStr} installed successfully`);
+            // Sanity-check: if verification found a version that doesn't match what was requested,
+            // the installer ran but PATH still resolves the old binary (common on Windows after install).
+            // Report honestly instead of asserting the wrong version as success.
+            const requestedVersion = actualVersionToInstall;
+            const versionMismatch =
+              requestedVersion &&
+              /^\d+\.\d+\.\d+/.test(requestedVersion) &&
+              displayVersion &&
+              displayVersion !== requestedVersion;
+
+            if (versionMismatch) {
+              spinner.warn(
+                `${agent.displayName} installation completed, but the detected version` +
+                ` (v${displayVersion}) does not match the requested version (v${requestedVersion}).` +
+                ` A terminal restart may be required.`,
+              );
+            } else {
+              spinner.succeed(`${agent.displayName}${installedVersionStr} installed successfully`);
+            }
 
             // Run additional installation steps (e.g., sounds)
             if (agent.additionalInstallation) {
@@ -196,11 +214,11 @@ export function createInstallCommand(): Command {
             }
 
             // Show warning if installed version is newer than supported
-            if (installedVersion && agent.checkVersionCompatibility) {
+            if (displayVersion && agent.checkVersionCompatibility) {
               const compat = await agent.checkVersionCompatibility();
               if (compat.isNewer) {
                 console.log();
-                console.log(chalk.yellow(`⚠️  Note: This version (${installedVersion}) is newer than the supported version (${compat.supportedVersion}).`));
+                console.log(chalk.yellow(`⚠️  Note: This version (${displayVersion}) is newer than the supported version (${compat.supportedVersion}).`));
                 console.log(chalk.yellow(`   You may encounter compatibility issues with the CodeMie backend.`));
                 console.log(chalk.yellow(`   To install the supported version, run:`), chalk.blueBright(`codemie install ${agent.name} --supported`));
               }
@@ -271,7 +289,7 @@ export function createInstallCommand(): Command {
           const spinner = ora(spinnerLabel).start();
 
           try {
-            const scriptPath = await installStatusline();
+            const { scriptPath } = await installStatusline();
             const successMsg = alreadyInstalled
               ? `${STATUSLINE_DISPLAY_NAME} updated`
               : `${STATUSLINE_DISPLAY_NAME} installed`;
@@ -280,15 +298,7 @@ export function createInstallCommand(): Command {
             console.log(chalk.cyan('💡 The statusline appears at the bottom of every Claude Code session'));
             console.log(chalk.white(`   ${STATUSLINE_DESCRIPTION}`));
             console.log(chalk.gray(`   Script: ${scriptPath}`));
-            console.log();
-
-            const budgetSelected = await promptBudgetSelection();
-            if (budgetSelected) {
-              console.log(chalk.green('✓ Budget selected for tracking'));
-            } else {
-              console.log(chalk.yellow('⚠️  Budget tracking requires authentication. Run: codemie setup'));
-            }
-
+            console.log(chalk.gray('   Budget is auto-detected from your authenticated CodeMie profile — no setup needed'));
             console.log();
           } catch (error: unknown) {
             spinner.fail(`Failed to install ${STATUSLINE_DISPLAY_NAME}`);
@@ -308,7 +318,7 @@ export function createInstallCommand(): Command {
           console.error(chalk.red(`✗ ${getErrorMessage(error)}`));
           console.log();
           console.log(chalk.cyan('💡 Available agents:'));
-          const allAgents = AgentRegistry.getAllAgents();
+          const allAgents = AgentRegistry.getManageableAgents();
           for (const agent of allAgents) {
             console.log(chalk.white(`   • ${agent.name}`));
           }

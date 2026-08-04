@@ -84,6 +84,9 @@ export interface ProviderProfile {
     tokenEnvVar?: string;
     expiresAt?: number;
   };
+  // Keycloak / SSO auth fields (required by SDK for SSO; not used with jwt_token)
+  authServerUrl?: string;
+  authRealm?: string;
 
   // AWS Bedrock-specific fields
   awsProfile?: string;
@@ -131,9 +134,6 @@ export interface ProviderProfile {
 
   // Claude Code-specific settings
   claudeAutocompactPct?: number; // Auto-compact threshold percentage (sets CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, default: 85)
-
-  // Statusline budget tracking
-  statuslineBudgetName?: string; // Budget row name selected during statusline install
 }
 
 /**

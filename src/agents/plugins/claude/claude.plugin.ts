@@ -18,7 +18,8 @@ import {
 import { logger } from '../../../utils/logger.js';
 import { sanitizeLogArgs } from '../../../utils/security.js';
 import chalk from 'chalk';
-import { resolveHomeDir, getDirname } from '../../../utils/paths.js';
+import stripAnsi from 'strip-ansi';
+import { resolveHomeDir } from '../../../utils/paths.js';
 import {
   detectInstallationMethod,
   type InstallationMethod,
@@ -34,17 +35,17 @@ let statuslineManagedThisSession = false;
  *
  * **UPDATE THIS WHEN BUMPING CLAUDE VERSION**
  */
-const CLAUDE_SUPPORTED_VERSION = '2.1.199';
+export const CLAUDE_SUPPORTED_VERSION = '2.1.218';
 
 /**
  * Minimum supported Claude Code version
  * Versions below this are known to be incompatible and will be blocked from starting
  * Rule: always 10 patch versions below CLAUDE_SUPPORTED_VERSION
- * e.g. supported = 2.1.199 → minimum = 2.1.189
+ * e.g. supported = 2.1.218 → minimum = 2.1.208
  *
  * **UPDATE THIS WHEN BUMPING CLAUDE VERSION**
  */
-const CLAUDE_MINIMUM_SUPPORTED_VERSION = '2.1.189';
+const CLAUDE_MINIMUM_SUPPORTED_VERSION = '2.1.208';
 
 /**
  * Claude Code installer URLs
@@ -66,6 +67,8 @@ export const ClaudePluginMetadata: AgentMetadata = {
 
   npmPackage: '@anthropic-ai/claude-code',
   cliCommand: 'claude',
+
+  sessionAnalyticsReport: true,
 
   // Version management configuration
   supportedVersion: CLAUDE_SUPPORTED_VERSION,       // Latest version tested with CodeMie backend
@@ -198,68 +201,99 @@ export const ClaudePluginMetadata: AgentMetadata = {
         env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(autocompactPct);
       }
 
-      // Statusline setup: when --status flag is passed, configure Claude Code
-      // status bar with a multi-line display showing model, context, git, cost
+      // Statusline setup: when --status is passed, ensure the CodeMie statusline is
+      // installed — the same installer `codemie install statusline` uses, so there is
+      // exactly one statusline implementation instead of a separate duplicated one here.
       // https://code.claude.com/docs/en/statusline
       if (env.CODEMIE_STATUS === '1') {
-        const { writeFile, readFile, mkdir, chmod } = await import('fs/promises');
-        const { existsSync } = await import('fs');
-        const { join } = await import('path');
-
-        const claudeHome = resolveHomeDir('.claude');
-        const scriptPath = join(claudeHome, 'codemie-statusline.mjs');
-        const settingsPath = join(claudeHome, 'settings.json');
-
-        // Read the statusline script from the compiled output directory
-        const scriptContent = await readFile(
-          join(getDirname(import.meta.url), 'plugin/codemie-statusline.mjs'),
-          'utf-8'
-        );
-
-        // Ensure ~/.claude directory exists
-        if (!existsSync(claudeHome)) {
-          await mkdir(claudeHome, { recursive: true });
+        try {
+          const { installStatusline } = await import('./statusline-installer.js');
+          const { alreadyConfigured } = await installStatusline();
+          // Only clean up on afterRun if THIS session enabled it — a persistent
+          // `codemie install statusline` setup must survive after the session ends.
+          statuslineManagedThisSession = !alreadyConfigured;
+        } catch (error) {
+          logger.warn(
+            '[Claude] Failed to configure statusline via --status flag',
+            ...sanitizeLogArgs({
+              error: error instanceof Error ? error.message : String(error),
+            })
+          );
         }
+      }
 
-        // Write script (always update to latest version)
-        await writeFile(scriptPath, scriptContent, 'utf-8');
-
-        // Make script executable on Unix systems
-        if (process.platform !== 'win32') {
-          await chmod(scriptPath, 0o755);
-        }
-
-        // Inject statusLine into ~/.claude/settings.json if not already configured
-        let settings: Record<string, unknown> = {};
-        if (existsSync(settingsPath)) {
-          try {
-            const raw = await readFile(settingsPath, 'utf-8');
-            settings = JSON.parse(raw) as Record<string, unknown>;
-          } catch (parseError) {
-            // Abort injection to prevent overwriting potentially valid settings
-            // that are temporarily unreadable (e.g., concurrent write, partial flush)
-            logger.warn(
-              '[Claude] Could not parse settings.json, skipping statusline injection to avoid data loss',
-              ...sanitizeLogArgs({
-                settingsPath,
-                error: parseError instanceof Error ? parseError.message : String(parseError),
-              })
-            );
-            return env;
-          }
-        }
-
-        if (!settings.statusLine) {
-          settings.statusLine = {
-            type: 'command',
-            // Quote the path to handle spaces in home directory (e.g. /Users/John Doe/)
-            command: `node "${scriptPath}"`,
+      // Detect ANTHROPIC_BASE_URL override in ~/.claude/settings.json
+      // Claude Code reads settings.json at startup and silently overrides env vars;
+      // warn the user so they know which endpoint is actually in use.
+      try {
+        const { detectSettingsConflict } = await import('./settings-conflict.js');
+        const conflict = await detectSettingsConflict(env);
+        if (conflict) {
+          // ASCII allowlist: accept only printable ASCII (0x20–0x7E) after stripping ANSI
+          // sequences. This blocks C0/C1 bytes, Bidi override chars, soft hyphen,
+          // zero-width chars, combining marks, and every other non-ASCII Unicode vector.
+          //
+          // DCS pre-strip: strip-ansi only removes the 2-byte introducer (\x1bP etc.),
+          // leaving the payload as plain ASCII. Strip the full sequence — from introducer
+          // to BEL/ST/C1-ST terminator — before handing off to strip-ansi. If no terminator
+          // is found, consume to end-of-string (greedy fallback) to prevent partial leakage.
+          //
+          // URL userinfo guard: https://user@evil.com routes to evil.com; the @ is valid
+          // ASCII so the allowlist cannot catch it — URL parsing is required.
+          const safeUrl = (s: string): string => {
+            // ESC-form: P=DCS X=SOS ^=PM _=APC; C1-form: \x90 \x98 \x9d(OSC) \x9e \x9f
+            const noStringCmds = s.replace(/(?:\x1b[PX^_]|[\x90\x98\x9d\x9e\x9f])[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, ''); // eslint-disable-line no-control-regex
+            const stripped = stripAnsi(noStringCmds).replace(/[^\x20-\x7e]/gu, '');
+            try {
+              const url = new URL(stripped);
+              if (url.username || url.password || url.search || url.hash) {
+                url.username = '';
+                url.password = '';
+                url.search = '';
+                url.hash = '';
+                return `[credentials removed] ${url.toString()}`;
+              }
+            } catch {
+              // Not a parseable URL — return stripped string as-is
+            }
+            return stripped;
           };
-          await writeFile(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
-          // Use module-level flag (not env var) to avoid leaking into subprocess env
-          statuslineManagedThisSession = true;
-          logger.debug('[Claude] Statusline configured', { scriptPath });
+          // The fallback literal contains U+2014 (em dash) which the ASCII allowlist strips.
+          // Bypass safeUrl for the known-safe constant; only user-controlled values need it.
+          console.error(chalk.yellow('\n⚠️  ~/.claude/settings.json overrides detected'));
+          console.error(chalk.yellow('─'.repeat(60)));
+          if (conflict.settingsUrl) {
+            const profileDisplay = conflict.profileUrl
+              ? safeUrl(conflict.profileUrl)
+              : '(not set — direct Anthropic API)';
+            const activeDisplay = safeUrl(conflict.settingsUrl);
+            console.error(chalk.yellow(`  Profile URL   │ ${profileDisplay}`));
+            console.error(chalk.yellow(`  Active URL    │ ${activeDisplay}  ← settings.json wins`));
+            console.error(chalk.yellow(''));
+          }
+          if (conflict.settingsModel) {
+            const profileModelDisplay = conflict.profileModel
+              ? safeUrl(conflict.profileModel)
+              : '(not set — profile default)';
+            const activeModelDisplay = safeUrl(conflict.settingsModel);
+            console.error(chalk.yellow(`  Profile model │ ${profileModelDisplay}`));
+            console.error(chalk.yellow(`  Active model  │ ${activeModelDisplay}  ← settings.json wins`));
+            console.error(chalk.yellow(''));
+          }
+          console.error(chalk.yellow('  ~/.claude/settings.json values take precedence over the profile.'));
+          console.error(chalk.yellow('  Session will use the settings.json values.'));
+          console.error(chalk.yellow(''));
+          console.error(chalk.yellow('  To fix: remove overriding keys from ~/.claude/settings.json'));
+          console.error(chalk.yellow('─'.repeat(60)));
+          console.error('');
         }
+      } catch (error) {
+        logger.warn(
+          '[Claude] Failed to check for ANTHROPIC_BASE_URL settings conflict',
+          ...sanitizeLogArgs({
+            error: error instanceof Error ? error.message : String(error),
+          })
+        );
       }
 
       return env;
@@ -357,6 +391,20 @@ export class ClaudePlugin extends BaseAgentAdapter {
    *
    * @returns Version string or null if not installed
    */
+  private async execVersionAtFullPath(): Promise<string | null> {
+    if (process.platform === 'win32') return null;
+    const { exec } = await import('../../../utils/processes.js');
+    const fullPath = resolveHomeDir('.local/bin/claude');
+    try {
+      const result = await exec(fullPath, ['--version']);
+      if (result.code !== 0) return null;
+      const trimmed = result.stdout.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    } catch {
+      return null;
+    }
+  }
+
   async getVersion(): Promise<string | null> {
     if (!this.metadata.cliCommand) {
       return null;
@@ -365,21 +413,10 @@ export class ClaudePlugin extends BaseAgentAdapter {
     const { exec } = await import('../../../utils/processes.js');
 
     // Try full path first on Unix systems (native installer places binary at ~/.local/bin/claude)
-    if (process.platform !== 'win32') {
-      const fullPath = resolveHomeDir('.local/bin/claude');
-      try {
-        const result = await exec(fullPath, ['--version']);
-
-        // Parse version from output like '2.1.23 (Claude Code)'
-        const versionMatch = result.stdout.trim().match(/^(\d+\.\d+\.\d+)/);
-        if (versionMatch) {
-          return versionMatch[1];
-        }
-
-        return result.stdout.trim();
-      } catch {
-        // Full path check failed, fall through to PATH check
-      }
+    const fullPathOutput = await this.execVersionAtFullPath();
+    if (fullPathOutput !== null) {
+      const versionMatch = fullPathOutput.match(/^(\d+\.\d+\.\d+)/);
+      return versionMatch ? versionMatch[1] : fullPathOutput;
     }
 
     // Fall back to command in PATH (works for npm installations, Windows, etc.)
@@ -387,7 +424,6 @@ export class ClaudePlugin extends BaseAgentAdapter {
       const result = await exec(this.metadata.cliCommand, ['--version']);
 
       // Parse version from output like '2.1.23 (Claude Code)'
-      // Extract just the version number
       const versionMatch = result.stdout.trim().match(/^(\d+\.\d+\.\d+)/);
       if (versionMatch) {
         return versionMatch[1];
@@ -425,26 +461,12 @@ export class ClaudePlugin extends BaseAgentAdapter {
       return true; // Built-in agents are always "installed"
     }
 
-    // On Unix systems, check full path first (native installer places binary at ~/.local/bin/claude)
-    // This avoids PATH issues where ~/.local/bin is not in user's PATH
-    if (process.platform !== 'win32') {
-      const fullPath = resolveHomeDir('.local/bin/claude');
-      try {
-        const { exec } = await import('../../../utils/processes.js');
-        const result = await exec(fullPath, ['--version']);
-        if (result.code === 0) {
-          return true;
-        }
-      } catch {
-        // Full path check failed, fall through to PATH check
-      }
+    // On Unix, check full path first to avoid PATH issues
+    if (await this.execVersionAtFullPath() !== null) {
+      return true;
     }
 
     // Fall back to base implementation (checks if command is in PATH)
-    // This handles:
-    // 1. npm global installations (in PATH)
-    // 2. Windows installations
-    // 3. Other installation methods
     return super.isInstalled();
   }
 
@@ -471,7 +493,7 @@ export class ClaudePlugin extends BaseAgentAdapter {
    * @param version - Version string (e.g., '2.0.30', 'latest', 'supported')
    * @throws {AgentInstallationError} If installation fails
    */
-  async installVersion(version?: string): Promise<void> {
+  async installVersion(version?: string): Promise<string | null> {
     const metadata = this.metadata;
 
     // Resolve 'supported' to actual version from metadata
@@ -578,6 +600,8 @@ export class ClaudePlugin extends BaseAgentAdapter {
         );
       }
     }
+
+    return result.installedVersion ?? null;
   }
 
   /**

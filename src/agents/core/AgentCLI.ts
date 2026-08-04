@@ -5,6 +5,7 @@ import chalk from 'chalk';
 import type { AgentAdapter, ResumeOwnershipResult } from './types.js';
 import { ConfigLoader, CodeMieConfigOptions } from '../../utils/config.js';
 import { ensureApiBase, DEFAULT_CODEMIE_BASE_URL } from '../../providers/core/codemie-auth-helpers.js';
+import { AuthMethod, ProviderName } from '../../providers/core/types.js';
 import { JWTTemplate } from '../../providers/plugins/jwt/jwt.template.js';
 import { logger } from '../../utils/logger.js';
 import { getDirname } from '../../utils/paths.js';
@@ -77,6 +78,8 @@ export class AgentCLI {
       .option('--task <prompt>', 'Execute a single task (agent-specific flag mapping)')
       .option('--reasoning-effort <level>', 'Reasoning/thinking effort: minimal|low|medium|high|xhigh|max')
       .option('--resume <session-id>', 'Resume an existing session by ID')
+      .option('--no-analytics-report', 'Disable the automatic per-session analytics report written on exit')
+      .option('--print-config', 'Print the generated opencode config and exit without starting opencode')
       .allowUnknownOption()
       .argument('[args...]', `Arguments to pass to ${this.adapter.displayName}`)
       .action(async (args, options) => {
@@ -163,9 +166,10 @@ export class AgentCLI {
       }
 
       // Auto-enable silent mode in non-interactive mode (--task flag present)
-      // This suppresses welcome/goodbye messages and interactive prompts
+      // or when only printing the generated config (--print-config).
+      // This suppresses welcome/goodbye messages and interactive prompts.
       const isNonInteractiveMode = !!options.task;
-      const shouldBeSilent = options.silent || isNonInteractiveMode;
+      const shouldBeSilent = options.silent || isNonInteractiveMode || !!options.printConfig;
 
       // Apply silent mode from CLI flag or auto-detected non-interactive mode
       if (shouldBeSilent) {
@@ -173,6 +177,13 @@ export class AgentCLI {
         if ('setSilentMode' in this.adapter && typeof this.adapter.setSilentMode === 'function') {
           this.adapter.setSilentMode(true);
         }
+      }
+
+      // --print-config only makes sense for opencode: it's the only agent that
+      // generates its own on-the-fly config via a beforeRun hook.
+      if (options.printConfig && this.adapter.name !== 'opencode') {
+        console.error(chalk.red(`\n✗ --print-config is not supported for ${this.adapter.displayName}\n`));
+        process.exit(1);
       }
 
       // Load configuration with CLI overrides
@@ -189,14 +200,14 @@ export class AgentCLI {
       // JWT token from CLI overrides everything
       if (options.jwtToken) {
         process.env.CODEMIE_JWT_TOKEN = options.jwtToken as string;
-        process.env.CODEMIE_AUTH_METHOD = 'jwt';
+        process.env.CODEMIE_AUTH_METHOD = AuthMethod.JWT;
 
         const hasNoConfig = !options.provider
           && !(await ConfigLoader.hasGlobalConfig())
           && !(await ConfigLoader.hasLocalConfig(process.cwd()));
 
         if (hasNoConfig) {
-          config.provider = 'bearer-auth';
+          config.provider = ProviderName.BEARER_AUTH;
           if (!config.model) {
             config.model = JWTTemplate.recommendedModels?.[0];
           }
@@ -206,7 +217,7 @@ export class AgentCLI {
             ? ensureApiBase(config.codeMieUrl)
             : ensureApiBase(DEFAULT_CODEMIE_BASE_URL);
         }
-        config.authMethod = 'jwt';
+        config.authMethod = AuthMethod.JWT;
       }
 
       // Validate --reasoning-effort (catches both CLI flag and profile defaults)
@@ -240,7 +251,7 @@ export class AgentCLI {
 
       // Skip apiKey validation for SSO and JWT authentication methods
       const authMethod = config.authMethod;
-      const usesAlternativeAuth = authMethod === 'sso' || authMethod === 'jwt';
+      const usesAlternativeAuth = authMethod === AuthMethod.SSO || authMethod === AuthMethod.JWT;
 
       if (requiresAuth && !config.apiKey && !usesAlternativeAuth) {
         missingFields.push('apiKey');
@@ -289,7 +300,7 @@ export class AgentCLI {
       // which gets spread after process.env in BaseAgentAdapter.run(), erasing the
       // 'jwt' value we set in process.env above and causing the proxy to use the SSO path.
       if (options.jwtToken) {
-        providerEnv.CODEMIE_AUTH_METHOD = 'jwt';
+        providerEnv.CODEMIE_AUTH_METHOD = AuthMethod.JWT;
         providerEnv.CODEMIE_JWT_TOKEN = options.jwtToken as string;
       }
 
@@ -300,6 +311,12 @@ export class AgentCLI {
       // Pass status flag to lifecycle hooks
       if (options.status) {
         providerEnv.CODEMIE_STATUS = '1';
+      }
+
+      // Disable per-session analytics report on exit (default enabled).
+      // Commander sets options.analyticsReport = false only when --no-analytics-report is passed.
+      if (options.analyticsReport === false) {
+        providerEnv.CODEMIE_SESSION_ANALYTICS_REPORT = '0';
       }
 
       // Serialize full profile config for proxy plugins (read once at CLI level)
@@ -387,7 +404,7 @@ export class AgentCLI {
       logger.debug(`[AgentCLI] collected agentArgs: ${JSON.stringify(agentArgs)}`);
 
       // Run the agent (welcome message will be shown inside)
-      await this.adapter.run(agentArgs, providerEnv);
+      await this.adapter.run(agentArgs, providerEnv, options.printConfig ? { dryRun: true } : undefined);
       // Clean up the process-level flag set for same-process conversation sync consumers.
       delete process.env.CODEMIE_CONV_SYNC_DISABLED;
     } catch (error) {
@@ -526,7 +543,7 @@ export class AgentCLI {
   ): string[] {
     const agentArgs = [...args];
     // Config-only options (not passed to agent, handled by CodeMie CLI)
-    const configOnlyOptions = ['profile', 'provider', 'apiKey', 'baseUrl', 'timeout', 'model', 'silent', 'status', 'jwtToken', 'reasoningEffort'];
+    const configOnlyOptions = ['profile', 'provider', 'apiKey', 'baseUrl', 'timeout', 'model', 'silent', 'status', 'jwtToken', 'reasoningEffort', 'analyticsReport'];
 
     for (const [key, value] of Object.entries(options)) {
       // Skip config-only options (handled by CodeMie CLI layer)
